@@ -150,7 +150,7 @@ class BridgeTests(unittest.TestCase):
         id = b.send("tools/list", {"_meta": {}})
         self.assertEqual(b.response(id)["error"]["code"], -32602)
         id = b.send("initialize")
-        self.assertIn("2026-07-28", b.response(id)["error"]["message"])
+        self.assertEqual(b.response(id)["error"]["code"], -32600)
         for _ in range(32):
             b.listen()
         id = b.send("subscriptions/listen", {"notifications": {"toolsListChanged": True}})

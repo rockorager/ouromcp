@@ -15,6 +15,7 @@ Python 3.11+ is used only for independent test fixtures, never by the bridge.
 zig build -Doptimize=ReleaseSafe
 zig build test
 python3 -m unittest discover -s tests -v
+python3 tests/check_amp.py # optional: requires Amp in PATH
 zig-out/bin/ouro-mcp --app dev.ourokit.contacts
 ```
 
@@ -25,28 +26,52 @@ compiler in a fresh Amp orb; it does not configure or start services.
 
 ## Protocol and host compatibility
 
-Only **MCP 2026-07-28** is supported. Every request must contain
+The host-facing stdio connection supports two modes. The first valid modern
+request or legacy `initialize` selects the mode for that process; repeated
+initialization and mixing modes are rejected. **Connections to Ouro apps always
+use MCP 2026-07-28**, regardless of the host's mode.
+
+**Modern MCP 2026-07-28:** every request must contain
 `params._meta["io.modelcontextprotocol/protocolVersion"]` and an object at
-`params._meta["io.modelcontextprotocol/clientCapabilities"]`. There is no
-`initialize` handshake or legacy fallback. For example, send this single line:
+`params._meta["io.modelcontextprotocol/clientCapabilities"]`. No handshake is
+needed. For example, send this single line:
 
 ```json
 {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}
 ```
 
-The bridge implements `server/discover`, `tools/list`, `tools/call`,
+Modern mode implements `server/discover`, `tools/list`, `tools/call`,
 `subscriptions/listen` for `toolsListChanged`, and `notifications/cancelled`.
 Subscriptions are acknowledged by a notification, not a terminal response.
-Notifications carry the upstream subscription's original ID. Cancellation
-translates upstream request IDs into bridge-owned downstream IDs. IDs and all
-JSON numbers retain their lexemes; no floating-point conversion is involved.
+Notifications carry the upstream subscription's original ID.
 
-**The current Amp host is not compatible.** A parent-project integration check
-on September 11, 2026 used an isolated `amp mcp doctor` configuration. Amp sent
-legacy `initialize`; the bridge returned `-32601` with the supported revision.
-Doctor reported server status **error**, despite its own exit status being zero.
-Use a modern-per-request-metadata host. Adding legacy support is a separate
-product decision, not an automatic fallback.
+**Legacy MCP 2025-11-25 (current Amp):** send `initialize` with `protocolVersion`,
+`capabilities`, and `clientInfo`, then `notifications/initialized`. The bridge
+advertises only `tools: {listChanged: true}`. It accepts `tools/list`,
+`tools/call`, `ping`, and cancellation without modern request metadata. `ping`
+also works while waiting for `notifications/initialized`; tool requests do not.
+The only supported legacy revision is 2025-11-25. If another revision is offered,
+the initialization response proposes 2025-11-25; clients that cannot speak it
+must disconnect. Modern per-request version failures never trigger a fallback.
+
+Legacy list-change notifications are automatic after initialization, without a
+host subscription ID. Complete results omit top-level modern `resultType`,
+`ttlMs`, and `cacheScope`; nested application data, content, errors and `_meta`
+are preserved. Task-augmented calls, sampling, elicitation, progress forwarding
+and other optional legacy features are not supported or advertised.
+
+In both modes, cancellation translates host request IDs into bridge-owned
+downstream IDs. IDs and all JSON numbers retain their lexemes; no floating-point
+conversion is involved. Legacy and modern bridge processes can share the same
+app and cache because their downstream identity and capability context match.
+
+**Amp compatibility verified September 11, 2026** with Amp
+`0.0.1789147861-gec2643`: its measured initialization revision is 2025-11-25.
+`python3 tests/check_amp.py` runs `amp mcp doctor` with isolated settings, cwd,
+and XDG paths. It checks the actual **connected (1 tools)** status and expected
+tool name, and asserts zero connections to the fixture app. Doctor's exit code
+alone is insufficient: it also exits zero for failed connections. This checks
+handshake and discovery, not an interactive Amp model's tool invocation.
 
 Only complete results are supported; a missing `resultType` is treated as
 `complete`. Multi-round-trip results are rejected. The bridge does not advertise
@@ -143,6 +168,11 @@ multiple bridge processes, shared refresh locks, cache epochs/TTL/scope/jitter,
 dirty rereads, cancellation, no replay, number lexemes end to end and through
 caches, publication during an in-flight mutation, malformed/oversized frames,
 slow peers, deadlines, catalog limits, and output saturation.
+Legacy fixtures additionally cover handshake ordering and negotiation, mode
+isolation, result translation, mixed legacy/modern cache sharing and notification
+formats, dirty rereads, lossless numbers, cancellation and late replies. Fake
+services assert that downstream requests still carry modern metadata and empty
+client capabilities in both host modes.
 
 The Ourokit parent project owns `tests/mcp_bridge.py`. Against the publication
 fix executable it verified real `systemd-socket-activate` with one headless
@@ -157,4 +187,8 @@ Official protocol references:
 [discovery](https://modelcontextprotocol.io/specification/2026-07-28/server/discover),
 [subscriptions](https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/subscriptions),
 [cancellation](https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/cancellation),
-[caching](https://modelcontextprotocol.io/specification/2026-07-28/server/utilities/caching).
+[caching](https://modelcontextprotocol.io/specification/2026-07-28/server/utilities/caching),
+[legacy lifecycle](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle),
+[legacy tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools),
+[legacy ping](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/ping),
+[legacy cancellation](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/cancellation).

@@ -11,6 +11,7 @@ const max_subscriptions = 32;
 const timeout_ms = 10000;
 const timer_tag = 10000;
 const cancel_tag = 10001;
+const legacy_version = "2025-11-25";
 
 const Peer = struct {
     fd: c_int = -1,
@@ -70,6 +71,7 @@ const Bridge = struct {
     context: []const u8,
     next_id: i64 = 1,
     next_scan: i64 = 0,
+    host: enum { undecided, modern, initializing, legacy } = .undecided,
     catalog_error: bool = false,
     eof: bool = false,
     exit_at: i64 = 0,
@@ -107,7 +109,14 @@ const Bridge = struct {
         p.reading = true;
     }
     fn result(self: *Bridge, a: std.mem.Allocator, id: j.V, value: j.V) !void {
-        try self.send(a, 0, try j.obj(a, .{ .{ "jsonrpc", j.s("2.0") }, .{ "id", id }, .{ "result", value } }));
+        var result_value = value;
+        if (self.host == .legacy) {
+            // Remove only modern envelope fields, never application data.
+            _ = result_value.object.swapRemove("resultType");
+            _ = result_value.object.swapRemove("ttlMs");
+            _ = result_value.object.swapRemove("cacheScope");
+        }
+        try self.send(a, 0, try j.obj(a, .{ .{ "jsonrpc", j.s("2.0") }, .{ "id", id }, .{ "result", result_value } }));
     }
     fn rpcError(self: *Bridge, a: std.mem.Allocator, id: j.V, code: i64, message: []const u8) !void {
         try self.send(a, 0, try j.obj(a, .{ .{ "jsonrpc", j.s("2.0") }, .{ "id", id }, .{ "error", try j.obj(a, .{ .{ "code", j.n(code) }, .{ "message", j.s(message) } }) } }));
@@ -122,6 +131,10 @@ const Bridge = struct {
     }
     fn notify(self: *Bridge, a: std.mem.Allocator) !void {
         if (self.eof) return;
+        if (self.host == .legacy) {
+            try self.send(a, 0, try j.obj(a, .{ .{ "jsonrpc", j.s("2.0") }, .{ "method", j.s("notifications/tools/list_changed") } }));
+            return;
+        }
         for (self.subscriptions) |sub| if (sub) |bytes| {
             const parsed = try j.parse(a, bytes);
             try self.send(a, 0, try j.obj(a, .{ .{ "jsonrpc", j.s("2.0") }, .{ "method", j.s("notifications/tools/list_changed") }, .{ "params", try j.obj(a, .{.{ "_meta", try j.obj(a, .{.{ j.sub_key, parsed.value }}) }}) } }));
@@ -387,6 +400,9 @@ const Bridge = struct {
             return;
         }
         if (id == .null) {
+            if (std.mem.eql(u8, method, "notifications/initialized") and self.host == .initializing and (params == .null or params == .object)) {
+                self.host = .legacy;
+            }
             if (std.mem.eql(u8, method, "notifications/cancelled")) {
                 const target = j.get(params, "requestId");
                 for (&self.requests) |*slot| if (slot.*) |req| {
@@ -418,18 +434,55 @@ const Bridge = struct {
             return;
         };
         if (std.mem.eql(u8, method, "initialize")) {
-            try self.rpcError(a, id, -32601, "Only MCP 2026-07-28 is supported; initialize is not supported");
+            if (self.host != .undecided) {
+                try self.rpcError(a, id, -32600, "Host protocol already selected");
+                return;
+            }
+            const info = j.get(params, "clientInfo");
+            const meta = j.get(params, "_meta");
+            if (j.get(params, "protocolVersion") != .string or j.get(params, "capabilities") != .object or j.get(info, "name") != .string or j.get(info, "version") != .string or j.get(meta, j.version_key) != .null or j.get(meta, j.caps_key) != .null) {
+                try self.rpcError(a, id, -32602, "Invalid initialize parameters");
+                return;
+            }
+            // Legacy negotiation returns our supported alternative if needed.
+            // This never changes the downstream protocol or cache context.
+            self.host = .initializing;
+            try self.result(a, id, try j.obj(a, .{ .{ "protocolVersion", j.s(legacy_version) }, .{ "capabilities", try j.obj(a, .{.{ "tools", try j.obj(a, .{.{ "listChanged", j.V{ .bool = true } }}) }}) }, .{ "serverInfo", try j.obj(a, .{ .{ "name", j.s("ouro-mcp") }, .{ "version", j.s("0.1.0") } }) } }));
             return;
         }
         const meta = j.get(params, "_meta");
         const version = j.get(meta, j.version_key);
-        if (version != .string or j.get(meta, j.caps_key) != .object) {
-            try self.rpcError(a, id, -32602, "Required per-request MCP metadata missing");
-            return;
-        }
-        if (!j.eq(version, j.version)) {
-            try self.send(a, 0, try j.obj(a, .{ .{ "jsonrpc", j.s("2.0") }, .{ "id", id }, .{ "error", try j.obj(a, .{ .{ "code", j.n(-32022) }, .{ "message", j.s("Unsupported protocol version") }, .{ "data", try j.obj(a, .{ .{ "supported", try j.arr(a, &.{j.s(j.version)}) }, .{ "requested", version } }) } }) } }));
-            return;
+        if (self.host == .initializing or self.host == .legacy) {
+            if (version != .null or j.get(meta, j.caps_key) != .null) {
+                try self.rpcError(a, id, -32602, "Cannot mix host protocol modes");
+                return;
+            }
+            if (std.mem.eql(u8, method, "ping")) {
+                try self.result(a, id, try j.obj(a, .{}));
+                return;
+            }
+            if (self.host == .initializing) {
+                try self.rpcError(a, id, -32600, "Expected notifications/initialized");
+                return;
+            }
+            if (!std.mem.eql(u8, method, "tools/list") and !std.mem.eql(u8, method, "tools/call")) {
+                try self.rpcError(a, id, -32601, "Method not found");
+                return;
+            }
+            if (j.get(params, "task") != .null) {
+                try self.rpcError(a, id, -32602, "Task-augmented calls are not supported");
+                return;
+            }
+        } else {
+            if (version != .string or j.get(meta, j.caps_key) != .object) {
+                try self.rpcError(a, id, -32602, "Required per-request MCP metadata missing");
+                return;
+            }
+            if (!j.eq(version, j.version)) {
+                try self.send(a, 0, try j.obj(a, .{ .{ "jsonrpc", j.s("2.0") }, .{ "id", id }, .{ "error", try j.obj(a, .{ .{ "code", j.n(-32022) }, .{ "message", j.s("Unsupported protocol version") }, .{ "data", try j.obj(a, .{ .{ "supported", try j.arr(a, &.{j.s(j.version)}) }, .{ "requested", version } }) } }) } }));
+                return;
+            }
+            self.host = .modern;
         }
         if (std.mem.eql(u8, method, "server/discover")) {
             try self.result(a, id, try j.obj(a, .{ .{ "resultType", j.s("complete") }, .{ "supportedVersions", try j.arr(a, &.{j.s(j.version)}) }, .{ "capabilities", try j.obj(a, .{.{ "tools", try j.obj(a, .{.{ "listChanged", j.V{ .bool = true } }}) }}) }, .{ "_meta", try j.obj(a, .{.{ "io.modelcontextprotocol/serverInfo", try j.obj(a, .{ .{ "name", j.s("ouro-mcp") }, .{ "version", j.s("0.1.0") } }) }}) }, .{ "ttlMs", j.n(0) }, .{ "cacheScope", j.s("private") } }));
@@ -624,14 +677,15 @@ const Bridge = struct {
             return;
         }
         for (&self.requests) |*slot| if (slot.*) |req| if (req.app == index and req.downstream == id) {
-            var response = v;
-            try response.object.put(a, "id", req.id());
-            if (value != .null and j.get(value, "resultType") == .null) {
+            if (value != .null) {
                 var complete = value;
-                try complete.object.put(a, "resultType", j.s("complete"));
-                try response.object.put(a, "result", complete);
+                if (j.get(value, "resultType") == .null) try complete.object.put(a, "resultType", j.s("complete"));
+                try self.result(a, req.id(), complete);
+            } else {
+                var response = v;
+                try response.object.put(a, "id", req.id());
+                try self.send(a, 0, response);
             }
-            try self.send(a, 0, response);
             req.doc.deinit();
             slot.* = null;
             return;
