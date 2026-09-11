@@ -128,7 +128,11 @@ class Bridge:
         return self.request("tools/call", {"name": exposed(name, app), "arguments": {"amount": amount}})
 
     def tools(self):
-        return {t["name"] for t in self.request("tools/list")["tools"]}
+        """Return application tools; bridge-owned tools are tested separately."""
+        return {t["name"] for t in self.request("tools/list")["tools"] if t["name"] != "reload-tools"}
+
+    def reload(self):
+        return self.request("tools/call", {"name": "reload-tools", "arguments": {}})
 
     def listen(self):
         id = self.send("subscriptions/listen", {"notifications": {"toolsListChanged": True}})

@@ -24,10 +24,11 @@ def main():
         print(output, end="")
         # Doctor also exits zero for failed connections; check the status itself.
         assert result.returncode == 0, result.returncode
-        assert f"connected (1 tools: {exposed('add')})" in output, output
+        assert "connected (2 tools:" in output, output
+        assert exposed("add") in output and "reload-tools" in output, output
         assert ": error" not in output, output
         assert not service.connections, "Doctor discovery activated the application"
-        print("PASS: Amp connected, discovered the expected tool, and made zero app connections")
+        print("PASS: Amp connected, discovered the application and reload tools, and made zero app connections")
     finally:
         e.close()
 

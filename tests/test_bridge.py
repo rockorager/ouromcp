@@ -25,8 +25,12 @@ class BridgeTests(unittest.TestCase):
             "name": exposed("user"), "description": f"[{APP}/user] Independent fixture"})
         self.assertEqual(service.connections, [])
         top.write_text("invalid")
+        time.sleep(1.2)
+        self.assertEqual(b.tools(), {exposed("user")})
+        b.reload()
         self.assertEqual(b.tools(), set())
         top.unlink()
+        b.reload()
         self.assertEqual(b.tools(), {exposed("system")})
         self.assertEqual(service.connections, [])
 
@@ -125,20 +129,25 @@ class BridgeTests(unittest.TestCase):
         b = self.e.bridge()
         self.assertEqual(b.tools(), {exposed("live")})
         p.chmod(0o666)
+        b.reload()
         self.assertEqual(b.tools(), {exposed("add")})
         p.chmod(0o600)
         data = json.loads(p.read_text())
         data["endpoint"]["runtime_path"] = "evil"
         p.write_bytes(encode(data))
+        b.reload()
         self.assertEqual(b.tools(), {exposed("add")})
         data["endpoint"]["runtime_path"] = "s-" + APP
         data["runtime"]["start_ticks"] = "0"
         p.write_bytes(encode(data))
+        b.reload()
         self.assertEqual(b.tools(), {exposed("add")})
         data["runtime"]["start_ticks"] = ticks
         p.write_bytes(encode(data))
+        b.reload()
         self.assertEqual(b.tools(), {exposed("live")})
         p.unlink()
+        b.reload()
         self.assertEqual(b.tools(), {exposed("add")})
 
     def test_modern_metadata_and_subscription_capacity(self):
@@ -190,6 +199,7 @@ class BridgeTests(unittest.TestCase):
         wait_for(lambda: len(service.calls) == 1)
         ticks = Path(f"/proc/{os.getpid()}/stat").read_text().rsplit(")", 1)[1].split()[19]
         self.e.descriptor(runtime_dir=True, runtime={"pid": os.getpid(), "start_ticks": ticks})
+        b.reload()
         self.assertEqual(b.tools(), {exposed("add")})
         service.send(service.connections[0], {"jsonrpc": "2.0", "id": service.calls[0]["id"],
                      "result": {"content": [], "structuredContent": {"count": 2}}})
@@ -198,6 +208,53 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(b.call(9)["structuredContent"], {"count": 9})
         self.assertEqual(len(service.connections), 1)
         self.assertEqual(len(service.calls), 2)
+
+    def test_explicit_reload_discovers_without_activation_and_notifies(self):
+        b = self.e.bridge()
+        subscription = b.listen()
+        self.assertEqual(b.tools(), set())
+        self.assertIn("reload-tools", {t["name"] for t in b.request("tools/list")["tools"]})
+        self.e.descriptor([tool("new")])
+        service = self.e.service(tools=[tool("new")])
+        time.sleep(1.2)
+        self.assertEqual(b.tools(), set())
+        result = b.reload()
+        self.assertEqual(result["structuredContent"], {"applications": 1, "tools": 1, "failures": 0})
+        self.assertEqual(json.loads(result["content"][0]["text"]), result["structuredContent"])
+        b.receive(lambda m: m.get("method") == "notifications/tools/list_changed" and m["params"]["_meta"][SUB] == subscription)
+        self.assertEqual(b.tools(), {exposed("new")})
+        b.reload()
+        self.assertEqual(service.connections, [])
+
+    def test_reload_invalidates_offline_live_cache_without_connecting(self):
+        self.e.descriptor()
+        service = self.e.service(tools=[tool(), tool("live")])
+        active = self.e.bridge()
+        active.call()
+        offline = self.e.bridge()
+        self.assertEqual(offline.tools(), {exposed("add"), exposed("live")})
+        result = offline.reload()
+        self.assertEqual(result["structuredContent"], {"applications": 1, "tools": 1, "failures": 0})
+        self.assertEqual(offline.tools(), {exposed("add")})
+        self.assertEqual(len(service.connections), 1)
+
+    def test_reload_replaces_connected_schema_and_reports_failed_refresh(self):
+        self.e.descriptor()
+        service = self.e.service()
+        b = self.e.bridge()
+        b.call()
+        changed = tool() | {"inputSchema": {"type": "object", "properties": {"new": {"type": "boolean"}}}}
+        service.tools = [changed]
+        self.assertFalse(b.reload()["isError"])
+        tools = b.request("tools/list")["tools"]
+        self.assertEqual(next(t for t in tools if t["name"] == exposed("add"))["inputSchema"], changed["inputSchema"])
+        self.assertEqual(service.list_count, 2)
+        service.tools = [{"name": "invalid"}]
+        result = b.reload()
+        self.assertTrue(result["isError"])
+        self.assertEqual(result["structuredContent"]["failures"], 1)
+        self.assertEqual(json.loads(result["content"][0]["text"]), result["structuredContent"])
+        self.assertEqual(len(service.connections), 1)
 
 
 if __name__ == "__main__":

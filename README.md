@@ -68,8 +68,8 @@ app and cache because their downstream identity and capability context match.
 **Amp compatibility verified September 11, 2026** with Amp
 `0.0.1789147861-gec2643`: its measured initialization revision is 2025-11-25.
 `python3 tests/check_amp.py` runs `amp mcp doctor` with isolated settings, cwd,
-and XDG paths. It checks the actual **connected (1 tools)** status and expected
-tool name, and asserts zero connections to the fixture app. Doctor's exit code
+and XDG paths. It checks the actual **connected (2 tools)** status, including
+the application tool and `reload-tools`, and asserts zero connections to the fixture app. Doctor's exit code
 alone is insufficient: it also exits zero for failed connections. This checks
 handshake and discovery, not an interactive Amp model's tool invocation.
 
@@ -96,9 +96,12 @@ The source of truth is [the version 1 contract](mcp-discovery-contract.md).
   Descriptions preserve the app's description after an `[application/tool]`
   prefix. Object keys and tool ordering are canonicalized for comparison, while
   array ordering and numeric lexemes are preserved.
-* Descriptors are rescanned on access and at one-second intervals. Timer scans
-  never create connections. Publication at an unchanged endpoint preserves
-  in-flight mutations and marks old catalog fetches dirty.
+* Descriptors are scanned at bridge startup and only rescanned when the host
+  calls the always-present `reload-tools` tool. Waiting, `tools/list`, and calls
+  to application tools do not discover descriptor changes. Reload invalidates
+  stale catalog generations, refreshes already-connected apps, never activates
+  offline apps, preserves in-flight mutations, and emits `tools/list_changed`.
+  A host sees the new schema only if it honors that standard notification.
 * First use connects, requests a tools-change subscription, validates its ack,
   then obtains a live catalog or a fresh shared cache entry. Only ordinary
   `-32601`/`-32602` subscription errors or an empty accepted filter permit
@@ -118,7 +121,8 @@ The source of truth is [the version 1 contract](mcp-discovery-contract.md).
   captured before fetching. Corrupt entries are misses. Cache write failure
   does not fail a completed live catalog.
 * An offline bridge rechecks caches on later `tools/list` accesses and returns
-  to the installed/runtime baseline when they expire. TTLs never wake apps.
+  to its last discovered installed/runtime baseline when they expire. A reload
+  updates that baseline from descriptors without waking the app. TTLs never wake apps.
   Tool-call results are never cached.
 
 The filesystem is a same-user trust boundary, not an authentication mechanism.

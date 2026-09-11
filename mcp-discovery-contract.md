@@ -60,10 +60,11 @@ changes, not failed reloads. Graceful shutdown removes only the publisher's
 own file; a replacement must be preserved. Publication failures must not
 invalidate an already committed application generation.
 
-Bridges watch installed and runtime descriptors (bounded local rescanning is
-acceptable), without waking apps. Removing a live override restores the
-installed baseline. Changing the selected installation or descriptor invalidates
-its cached live catalog. This version has one service endpoint per application;
+Bridges scan installed and runtime descriptors at startup. They rescan only on
+an explicit `reload-tools` call; elapsed time and ordinary host requests do not
+change the discovered set. Reloading does not wake offline apps. Removing a live
+override takes effect on reload and restores the installed baseline. Changing
+the selected descriptor invalidates its cached live catalog. This version has one service endpoint per application;
 multiple bridge processes do not imply multiple application instances.
 
 ## Bridge behavior
@@ -90,6 +91,15 @@ one list refresh outstanding, with a dirty reread for changes during refresh.
 Notify subscribed upstream clients when the aggregate catalog changes.
 Forward tool calls with bridge-owned downstream IDs; correlate and translate
 cancellation and subscription IDs. Never automatically retry tool calls.
+
+The bridge always exposes an unhashed `reload-tools` tool in addition to hashed
+application tools. It accepts an empty object, rescans descriptors, invalidates
+stale cache generations, and refreshes catalogs only for apps already connected
+to this bridge. It preserves active calls and connections and emits the standard
+`tools/list_changed` notification even when the resulting catalog is unchanged.
+Its text and structured result report discovered application, application-tool,
+and failure counts. Descriptor/capacity failures are reported without hiding
+`reload-tools`. Hosts update schemas only if they honor list-change notifications.
 
 Only complete results are supported; absent `resultType` falls back to complete.
 Enforce the 4 MiB wire bound and bounded requests, subscriptions and output.

@@ -50,12 +50,17 @@ class LegacyTests(unittest.TestCase):
         self.assertIn("error", b.response(b.send("tools/list")))
         b.request("initialize", INIT)
         self.e.descriptor([tool("updated")])
-        time.sleep(1.2)  # Let the one-second descriptor scan run before ready.
+        time.sleep(1.2)  # Waiting and unrelated requests do not reload discovery.
         self.assertEqual(b.request("ping"), {})
         self.assertEqual(b.response(b.send("tools/list"))["error"]["code"], -32600)
         self.assertFalse(b.pending)
         b.initialized()
         self.assertEqual(set(b.request("tools/list")), {"tools"})
+        self.assertEqual(b.tools(), {exposed("add")})
+        result = b.reload()
+        self.assertEqual(result["structuredContent"], {"applications": 1, "tools": 1, "failures": 0})
+        self.assertEqual(b.receive(lambda m: m.get("method") == "notifications/tools/list_changed"),
+                         {"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
         self.assertEqual(b.tools(), {exposed("updated")})
         self.assertEqual(b.request("ping"), {})
         self.assertEqual(service.connections, [])

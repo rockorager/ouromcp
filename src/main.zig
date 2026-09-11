@@ -12,6 +12,7 @@ const timeout_ms = 10000;
 const timer_tag = 10000;
 const cancel_tag = 10001;
 const legacy_version = "2025-11-25";
+const reload_name = "reload-tools";
 // Permit one maximum frame plus the former bounded 1 MiB backlog. This avoids
 // multiplying queue memory by the wire-limit increase.
 const output_limit = j.limit + 1024 * 1024;
@@ -57,6 +58,9 @@ const Request = struct {
     doc: std.json.Parsed(j.V),
     app: ?usize,
     name: []const u8,
+    reload: bool = false,
+    reload_failures: usize = 0,
+    reload_apps: [catalog.max_apps]bool = @splat(false),
     downstream: i64 = 0,
     deadline: i64,
     fn id(self: Request) j.V {
@@ -73,7 +77,6 @@ const Bridge = struct {
     filters: []const []const u8,
     context: []const u8,
     next_id: i64 = 1,
-    next_scan: i64 = 0,
     host: enum { undecided, modern, initializing, legacy } = .undecided,
     catalog_error: bool = false,
     eof: bool = false,
@@ -189,7 +192,11 @@ const Bridge = struct {
         app.dirty = false;
         releaseLock(app);
         try self.closePeer(index + 1);
-        for (&self.requests) |*slot| if (slot.*) |req| {
+        for (&self.requests) |*slot| if (slot.*) |*req| {
+            if (req.reload and req.reload_apps[index]) {
+                req.reload_failures += 1;
+                req.reload_apps[index] = false;
+            }
             if (req.app == index) {
                 if (!self.eof) try self.rpcError(a, req.id(), -32000, message);
                 req.doc.deinit();
@@ -232,6 +239,7 @@ const Bridge = struct {
                 if (app.present and app.id != null and std.mem.eql(u8, app.id.?, entry.id) and std.mem.eql(u8, app.endpoint, entry.endpoint)) {
                     // Catalog publication does not replace the connection or an
                     // in-flight mutation. Mark any old-key list read dirty.
+                    try self.cache.invalidate(a, &app.key);
                     g.free(app.baseline);
                     app.baseline = try g.dupe(u8, entry.tools);
                     app.key = entry.key;
@@ -262,7 +270,26 @@ const Bridge = struct {
             try self.failApp(a, index, "Application removed");
             try self.notify(a);
         };
-        self.next_scan = fs.monotonic() + 1000;
+    }
+    fn reload(self: *Bridge, a: std.mem.Allocator) !void {
+        try self.scan(a);
+        for (&self.apps, 0..) |*app, index| if (app.present) {
+            try self.cache.invalidate(a, &app.key);
+            if (app.state == .offline) {
+                try self.setTools(a, index, app.baseline);
+                continue;
+            }
+            for (&self.requests) |*slot| if (slot.*) |*req| {
+                if (req.reload) req.reload_apps[index] = true;
+            };
+            app.dirty = true;
+            if (!app.want_refresh) app.deadline = fs.monotonic() + timeout_ms;
+            app.want_refresh = true;
+            try self.startRefresh(a, index);
+        };
+        // A reload is itself a catalog lifecycle event, even when the
+        // resulting catalog is byte-for-byte identical.
+        try self.notify(a);
     }
     fn connect(self: *Bridge, a: std.mem.Allocator, index: usize) !void {
         const app = &self.apps[index];
@@ -312,15 +339,29 @@ const Bridge = struct {
         app.deadline = fs.monotonic() + timeout_ms;
         try self.downstream(a, index, app.list_id, "tools/list", try j.obj(a, .{}));
     }
-    fn aggregate(self: *Bridge, a: std.mem.Allocator) !j.V {
-        if (self.catalog_error) return error.DiscoveryCapacity;
+    fn aggregate(self: *Bridge, a: std.mem.Allocator, capacity_error: *bool) !j.V {
+        capacity_error.* = false;
         var tools: std.array_list.Managed(j.V) = .init(a);
+        const reload_tool = try j.obj(a, .{
+            .{ "name", j.s(reload_name) },
+            .{ "description", j.s("Reload installed application descriptors and refresh catalogs for applications that are already connected. Use after installing or changing application tools.") },
+            .{ "inputSchema", try j.obj(a, .{ .{ "type", j.s("object") }, .{ "properties", try j.obj(a, .{}) }, .{ "additionalProperties", j.V{ .bool = false } } }) },
+            .{ "outputSchema", try j.obj(a, .{ .{ "type", j.s("object") }, .{ "properties", try j.obj(a, .{
+                .{ "applications", try j.obj(a, .{.{ "type", j.s("integer") }}) },
+                .{ "tools", try j.obj(a, .{.{ "type", j.s("integer") }}) },
+                .{ "failures", try j.obj(a, .{.{ "type", j.s("integer") }}) },
+            }) }, .{ "required", try j.arr(a, &.{ j.s("applications"), j.s("tools"), j.s("failures") }) }, .{ "additionalProperties", j.V{ .bool = false } } }) },
+        });
+        try tools.append(reload_tool);
         // Sort by exposed names below, independent of reusable app slot order.
         var total: usize = 0;
-        for (self.apps) |app| if (app.present) {
+        for (self.apps) |app| if (app.present and !self.catalog_error) {
             const parsed = try j.parse(a, app.tools);
             for (parsed.value.array.items) |tool| {
-                if (tools.items.len >= 1024) return error.CatalogCapacity;
+                if (tools.items.len >= 1024) {
+                    capacity_error.* = true;
+                    return j.obj(a, .{ .{ "resultType", j.s("complete") }, .{ "tools", try j.arr(a, &.{reload_tool}) }, .{ "ttlMs", j.n(0) }, .{ "cacheScope", j.s("private") } });
+                }
                 var value = tool;
                 const name = j.str(j.get(tool, "name")).?;
                 // put may resize the copied map, invalidating the original
@@ -329,7 +370,10 @@ const Bridge = struct {
                 try value.object.put(a, "name", j.s(try j.toolName(a, app.id.?, name)));
                 try value.object.put(a, "description", j.s(try std.fmt.allocPrint(a, "[{s}/{s}] {s}", .{ app.id.?, name, description })));
                 total += (try j.encode(a, value)).len + 1;
-                if (total > j.catalog_limit - 4096) return error.CatalogCapacity;
+                if (total > j.catalog_limit - 4096) {
+                    capacity_error.* = true;
+                    return j.obj(a, .{ .{ "resultType", j.s("complete") }, .{ "tools", try j.arr(a, &.{reload_tool}) }, .{ "ttlMs", j.n(0) }, .{ "cacheScope", j.s("private") } });
+                }
                 try tools.append(value);
             }
         };
@@ -372,12 +416,36 @@ const Bridge = struct {
                     waiting = true;
                 };
                 if (waiting) continue;
-                const value = self.aggregate(a) catch {
+                var capacity_error = false;
+                const value = self.aggregate(a, &capacity_error) catch {
                     try self.rpcError(a, req.id(), -32000, "Aggregate catalog capacity exceeded");
                     req.doc.deinit();
                     slot.* = null;
                     continue;
                 };
+                if (req.reload) {
+                    var applications: usize = 0;
+                    for (self.apps) |app| if (app.present) {
+                        applications += 1;
+                    };
+                    const tools = j.get(value, "tools").array.items.len - 1;
+                    const failures = req.reload_failures + @as(usize, if (self.catalog_error or capacity_error) 1 else 0);
+                    const structured = try j.obj(a, .{
+                        .{ "applications", j.n(@intCast(applications)) },
+                        .{ "tools", j.n(@intCast(tools)) },
+                        .{ "failures", j.n(@intCast(failures)) },
+                    });
+                    const text = try j.encode(a, structured);
+                    try self.result(a, req.id(), try j.obj(a, .{
+                        .{ "resultType", j.s("complete") },
+                        .{ "content", try j.arr(a, &.{try j.obj(a, .{ .{ "type", j.s("text") }, .{ "text", j.s(text) } })}) },
+                        .{ "structuredContent", structured },
+                        .{ "isError", j.V{ .bool = failures != 0 } },
+                    }));
+                    req.doc.deinit();
+                    slot.* = null;
+                    continue;
+                }
                 try self.result(a, req.id(), value);
                 req.doc.deinit();
                 slot.* = null;
@@ -514,15 +582,23 @@ const Bridge = struct {
             try self.rpcError(a, id, -32602, "Pagination cursors and multi-round-trip calls are not supported upstream");
             return;
         }
-        try self.scan(a);
         var target: ?usize = null;
         var original_name: []const u8 = "";
+        var is_reload = false;
         if (std.mem.eql(u8, method, "tools/call")) {
             const name = j.str(j.get(params, "name")) orelse {
                 try self.rpcError(a, id, -32602, "Missing tool name");
                 return;
             };
-            for (self.apps, 0..) |app, index| if (app.present) {
+            if (std.mem.eql(u8, name, reload_name)) {
+                const arguments = j.get(params, "arguments");
+                if (arguments != .null and (arguments != .object or arguments.object.count() != 0)) {
+                    try self.rpcError(a, id, -32602, "reload-tools accepts no arguments");
+                    return;
+                }
+                is_reload = true;
+            }
+            if (!is_reload) for (self.apps, 0..) |app, index| if (app.present) {
                 const parsed = try j.parse(a, app.tools);
                 for (parsed.value.array.items) |tool| {
                     const original = j.str(j.get(tool, "name")).?;
@@ -533,7 +609,7 @@ const Bridge = struct {
                     }
                 }
             };
-            if (target == null) {
+            if (target == null and !is_reload) {
                 try self.rpcError(a, id, -32602, "Unknown or removed tool");
                 return;
             }
@@ -541,15 +617,23 @@ const Bridge = struct {
             for (self.requests) |req| if (req != null and req.?.app == target) {
                 count += 1;
             };
-            if (count >= 30) {
+            if (!is_reload and count >= 30) {
                 try self.rpcError(a, id, -32000, "Application request capacity exceeded");
                 return;
             }
         }
         for (&self.requests) |*slot| if (slot.* == null) {
             const name_copy = try doc.arena.allocator().dupe(u8, original_name);
-            slot.* = .{ .doc = doc, .app = target, .name = name_copy, .deadline = fs.monotonic() + timeout_ms };
+            slot.* = .{ .doc = doc, .app = target, .name = name_copy, .reload = is_reload, .deadline = fs.monotonic() + timeout_ms };
             owned = false;
+            if (is_reload) {
+                self.reload(a) catch {
+                    try self.rpcError(a, id, -32000, "Could not reload application catalogs");
+                    slot.*.?.doc.deinit();
+                    slot.* = null;
+                    return;
+                };
+            }
             if (target) |index| {
                 const app = &self.apps[index];
                 if (app.state == .offline) self.connect(a, index) catch {
@@ -559,7 +643,7 @@ const Bridge = struct {
                     app.want_refresh = true;
                     try self.startRefresh(a, index);
                 }
-            } else {
+            } else if (!is_reload) {
                 for (&self.apps, 0..) |*app, index| if (app.present) {
                     if (!try self.useCache(a, index)) {
                         if (app.state == .offline) {
@@ -734,7 +818,6 @@ const Bridge = struct {
     fn maintenance(self: *Bridge, a: std.mem.Allocator) !void {
         const now = fs.monotonic();
         if (!self.eof) {
-            if (now >= self.next_scan) try self.scan(a);
             for (&self.apps, 0..) |*app, index| {
                 if (app.present and (app.want_refresh or app.state == .subscribing or app.state == .connecting)) {
                     if (now >= app.deadline) {
