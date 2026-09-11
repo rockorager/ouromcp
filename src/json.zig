@@ -1,6 +1,8 @@
 const std = @import("std");
 pub const V = std.json.Value;
-pub const limit = 256 * 1024;
+pub const limit = 4 * 1024 * 1024; // Wire frame bytes, including newline.
+pub const file_limit = 256 * 1024;
+pub const catalog_limit = 256 * 1024;
 pub const version = "2026-07-28";
 pub const version_key = "io.modelcontextprotocol/protocolVersion";
 pub const caps_key = "io.modelcontextprotocol/clientCapabilities";

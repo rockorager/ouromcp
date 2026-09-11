@@ -132,7 +132,7 @@ process. Cache locks themselves never block the I/O loop.
 
 | Resource | Bound |
 |---|---|
-| Wire frame, including newline | 256 KiB |
+| Wire frame, including newline | 4 MiB |
 | Descriptor/cache file | 256 KiB |
 | JSON nesting | 128 levels |
 | Installed applications | 64 |
@@ -142,7 +142,7 @@ process. Cache locks themselves never block the I/O loop.
 | Aggregate exposed catalog | 1,024 tools and <256 KiB |
 | Pending host requests | 128 total, 30 tool calls per app |
 | Upstream subscriptions / ID encoding | 32 / 1 KiB |
-| Each peer's output queue | 128 frames and 1 MiB |
+| Each peer's output queue | 128 frames and 5 MiB |
 | Connect, ack, refresh, request, frame, write deadlines | 10 seconds |
 | EOF output drain | At most 1 second |
 

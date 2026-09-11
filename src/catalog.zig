@@ -107,7 +107,7 @@ pub fn scan(a: std.mem.Allocator, filters: []const []const u8, context: []const 
             const sa = scratch.allocator();
             const origin = try std.fmt.allocPrint(sa, "{s}/{s}", .{ path, filename });
             const bytes = fs.read(sa, origin) catch |err| {
-                if (err == error.Oversize) read_bytes += j.limit;
+                if (err == error.Oversize) read_bytes += j.file_limit;
                 if (read_bytes > 16 * 1024 * 1024) return error.DiscoveryCapacity;
                 continue;
             };

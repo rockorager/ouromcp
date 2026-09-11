@@ -107,7 +107,7 @@ class Bridge:
                     return wire if raw else message
             if b"\n" in self.buffer:
                 line, self.buffer = self.buffer.split(b"\n", 1)
-                assert len(line) + 1 <= 256 * 1024
+                assert len(line) + 1 <= 4 * 1024 * 1024
                 self.pending.append((json.loads(line), line))
                 continue
             left = end - time.monotonic()
@@ -200,6 +200,8 @@ class Service:
         try:
             with conn.makefile("rb") as stream:
                 for raw in stream:
+                    if not raw.endswith(b"\n"):
+                        return
                     request = json.loads(raw)
                     method = request["method"]
                     p = request.get("params", {})
@@ -248,7 +250,7 @@ class Service:
                             conn.sendall(b'{"jsonrpc":"2.0","id":' + str(id).encode() + b',"result":{"content":[],"structuredContent":{"values":[1.0,1e0,999999999999999999999999999999999999,1e999,-0.125]}}}\n')
                             continue
                         if self.call_mode == "oversize":
-                            conn.sendall(b"x" * (256 * 1024))
+                            conn.sendall(b"x" * (4 * 1024 * 1024))
                             continue
                         self.counter += p.get("arguments", {}).get("amount", 0)
                         self.send(conn, {"jsonrpc": "2.0", "id": id, "result": {

@@ -204,7 +204,11 @@ class EdgeTests(unittest.TestCase):
         bad.raw(b"{invalid}\n")
         self.assertEqual(bad.receive()["error"]["code"], -32700)
         self.assertEqual(bad.tools(), {exposed("add")})
-        bad.raw(b"x" * (256 * 1024))
+        exact = encode({"jsonrpc": "2.0", "id": "boundary", "method": "server/discover", "params": {"_meta": META}})
+        limit = 4 * 1024 * 1024
+        bad.raw(exact[:-1] + b" " * (limit - len(exact)) + b"\n")
+        self.assertEqual(bad.response("boundary")["result"]["resultType"], "complete")
+        bad.raw(b"x" * limit)
         bad.p.wait(timeout=3)
         self.assertNotEqual(bad.p.returncode, 0)
         self.assertEqual(healthy.tools(), {exposed("add")})
@@ -252,10 +256,10 @@ class EdgeTests(unittest.TestCase):
         self.e.service(app=other)
         b = self.e.bridge()
         b.call()
-        ids = [b.send("tools/call", {"name": exposed("add"), "arguments": {"padding": "x" * 200000}}) for _ in range(7)]
+        ids = [b.send("tools/call", {"name": exposed("add"), "arguments": {"padding": "x" * 200000}}) for _ in range(30)]
         self.assertIn("error", b.response(ids[0]))
         self.assertEqual(b.call(17, app=other)["structuredContent"], {"count": 17})
-        self.assertEqual(len(slow.calls), 1)
+        self.assertLess(len(slow.calls), len(ids))
 
     def test_request_and_ack_deadlines_do_not_block_healthy_peer(self):
         self.e.descriptor()

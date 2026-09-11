@@ -35,7 +35,7 @@ pub fn readFd(a: std.mem.Allocator, fd: c_int) ![]u8 {
         const count = c.read(fd, &buf, buf.len);
         if (count < 0) return error.ReadFailed;
         if (count == 0) break;
-        if (data.written().len + @as(usize, @intCast(count)) > j.limit) return error.Oversize;
+        if (data.written().len + @as(usize, @intCast(count)) > j.file_limit) return error.Oversize;
         try data.writer.writeAll(buf[0..@intCast(count)]);
     }
     return data.toOwnedSlice();

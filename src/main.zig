@@ -12,6 +12,9 @@ const timeout_ms = 10000;
 const timer_tag = 10000;
 const cancel_tag = 10001;
 const legacy_version = "2025-11-25";
+// Permit one maximum frame plus the former bounded 1 MiB backlog. This avoids
+// multiplying queue memory by the wire-limit increase.
+const output_limit = j.limit + 1024 * 1024;
 
 const Peer = struct {
     fd: c_int = -1,
@@ -87,7 +90,7 @@ const Bridge = struct {
         if (bytes.len + 1 > j.limit) return error.MessageCapacity;
         const p = &self.peers[peer];
         if (p.closing or p.fd < 0) return error.Disconnected;
-        if (p.output.items.len >= 128 or p.output_bytes + bytes.len + 1 > 1024 * 1024) return error.OutputCapacity;
+        if (p.output.items.len >= 128 or p.output_bytes + bytes.len + 1 > output_limit) return error.OutputCapacity;
         const line = try g.alloc(u8, bytes.len + 1);
         @memcpy(line[0..bytes.len], bytes);
         line[bytes.len] = '\n';
@@ -326,7 +329,7 @@ const Bridge = struct {
                 try value.object.put(a, "name", j.s(try j.toolName(a, app.id.?, name)));
                 try value.object.put(a, "description", j.s(try std.fmt.allocPrint(a, "[{s}/{s}] {s}", .{ app.id.?, name, description })));
                 total += (try j.encode(a, value)).len + 1;
-                if (total > j.limit - 4096) return error.CatalogCapacity;
+                if (total > j.catalog_limit - 4096) return error.CatalogCapacity;
                 try tools.append(value);
             }
         };
@@ -642,7 +645,7 @@ const Bridge = struct {
             try all.array.appendSlice(tools.array.items);
             try catalog.validateTools(all);
             const encoded = try j.encode(a, all);
-            if (encoded.len > j.limit - 4096) return error.CatalogCapacity;
+            if (encoded.len > j.catalog_limit - 4096) return error.CatalogCapacity;
             g.free(app.pages);
             app.pages = try g.dupe(u8, encoded);
             // Each page's freshness starts when that page arrived, not when

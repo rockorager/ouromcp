@@ -51,7 +51,7 @@ pub const Cache = struct {
         const expires = fs.now() + @as(i64, @intCast(bounded_ttl - jitter));
         const value = try j.obj(a, .{ .{ "expires", j.n(expires) }, .{ "epoch", j.s(epoch_value) }, .{ "cacheScope", scope }, .{ "tools", tools } });
         const bytes = try j.encode(a, value);
-        if (bytes.len > j.limit) return;
+        if (bytes.len > j.file_limit) return;
         try fs.atomic(a, self.dir, try name(a, key, "json"), bytes);
         // A concurrent invalidation after the check is harmless: readers check epochs.
     }

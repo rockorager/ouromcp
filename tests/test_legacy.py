@@ -1,5 +1,6 @@
 """Host compatibility fixtures; the Unix service still requires modern MCP."""
 import concurrent.futures
+import json
 import time
 import unittest
 
@@ -138,6 +139,31 @@ class LegacyTests(unittest.TestCase):
         service.call_mode = "normal"
         self.assertEqual(b.call(7), {"content": [], "structuredContent": {"count": 7}})
         self.assertFalse(any(m.get("id") == first for m, _ in b.pending))
+
+    def test_json_text_and_structured_results_survive_both_host_modes(self):
+        self.e.descriptor()
+        service = self.e.service(call_mode="silent")
+        for legacy in (False, True):
+            b = self.bridge() if legacy else self.e.bridge()
+            for is_error in (False, True):
+                with self.subTest(legacy=legacy, is_error=is_error):
+                    data = ({"error": {"code": "Failed", "message": 'bad "value"\n\\é'}} if is_error else
+                            {"windows": [{"title": 'a "title"\n\\é', "x": -37}], "focused": None,
+                             "snapshot": "x" * (300 * 1024)})
+                    text = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+                    expected = {"content": [{"type": "text", "text": text}],
+                                "structuredContent": data, "isError": is_error}
+                    count = len(service.calls)
+                    id = b.send("tools/call", {"name": exposed("add")})
+                    wait_for(lambda: len(service.calls) == count + 1)
+                    service.send(service.connections[-1], {"jsonrpc": "2.0", "id": service.calls[-1]["id"],
+                                 "result": expected | {"resultType": "complete"}})
+                    result = b.response(id)["result"]
+                    self.assertEqual(result, expected if legacy else expected | {"resultType": "complete"})
+                    self.assertEqual(json.loads(result["content"][0]["text"]), result["structuredContent"])
+                    if not is_error:
+                        self.assertGreater(len(encode({"jsonrpc": "2.0", "id": id, "result": result})), 256 * 1024)
+            b.close()
 
     def test_result_envelope_only_and_no_replay(self):
         self.e.descriptor()
